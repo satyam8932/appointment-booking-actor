@@ -1,0 +1,18 @@
+{
+    "$schema": "https://apify.com/schemas/v1/actor.ide.json",
+    "actorSpecification": 1,
+    "name": "appointment-booking-actor",
+    "title": "Appointment Booking Verification - GHL",
+    "description": "Verifies appointment booking in GoHighLevel by finding 'Appointment [Lead Name] created' message in conversation and taking a screenshot.",
+    "version": "1.0",
+    "meta": {
+        "templateId": "ts-start",
+        "generatedBy": "Claude Code with Claude Opus 4.6"
+    },
+    "inputSchema": "./input_schema.json",
+    "dockerfile": "../Dockerfile",
+    "defaultRunOptions": {
+        "memoryMbytes": 2048,
+        "timeoutSecs": 3600
+    }
+}
