@@ -85,10 +85,30 @@ apify builds add-tag -b BUILD_ID -t latest
 2. Searches lead via global search (smart name matching, skips duplicates with "(2)" suffix)
 3. Opens lead conversation
 4. Closes activity sidebar panel
-5. Looks for "Appointment [Lead Name] created" text (also tries first-name-only and generic "Appointment")
-6. Scrolls up/down if not immediately visible
-7. Positions text at 40% from top of viewport for clean framing
-8. Takes screenshot, returns public URL
+5. Detects the element that actually scrolls the conversation (see below)
+6. Scrolls to the very end of the chat and keeps re-asserting the bottom until the thread stops growing
+7. Looks for "Appointment [Lead Name] created" text (also tries first-name-only and generic "Appointment"); if it is not at the bottom, scans upwards to confirm it exists, then returns to the bottom
+8. Re-confirms the bottom immediately before each screenshot attempt, then captures and returns the public URL
+
+### Scrolling to the end of the chat
+
+The screenshot is always taken at the bottom of the conversation. Getting there reliably needs
+three things, each of which used to fail intermittently:
+
+- **Finding the real scroller.** The scroll container is detected by probing for elements that
+  genuinely overflow (`overflow-y: auto/scroll` and `scrollHeight > clientHeight`), scored by size
+  and message-shaped children, and restricted to the main content column. Matching a selector like
+  `[class*="conversation"]` is not enough — that matches non-scrollable wrappers and the
+  `hl_conversations--list` contacts rail, and scrolling those moves the chat nowhere.
+- **Not stopping early.** Messages load lazily, so one `scrollTop = scrollHeight` lands at what was
+  the bottom a moment ago. The actor re-asserts the bottom until both the height and the position
+  hold steady for three consecutive rounds, falling back to real wheel/`End` input if programmatic
+  scrolling stalls.
+- **Staying at the bottom.** The bottom is re-confirmed right before every screenshot attempt, so
+  late-arriving content cannot leave the capture parked mid-thread.
+
+A conversation short enough to fit on screen has no scroll container; that is treated as already
+being at the end rather than as a failure.
 
 ## Config
 

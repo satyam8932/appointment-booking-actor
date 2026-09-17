@@ -18,9 +18,10 @@ interface ActorOutput {
     error: string | null;
 }
 
-const BRAVE_PATH = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser';
 const LOCAL_STORAGE_STATE = resolve(process.cwd(), 'storage-state.json');
 const CDP_ENDPOINT = 'http://127.0.0.1:9222';
+const SCROLL_CONTAINER_ATTR = 'data-appt-scroll-container';
+const BOTTOM_TOLERANCE_PX = 8;
 
 async function retry<T>(
     fn: () => Promise<T>,
@@ -44,7 +45,7 @@ async function getContext(input: ActorInput): Promise<{ context: BrowserContext;
 
     if (!isCloud) {
         try {
-            log.info('Connecting to Brave via CDP on port 9222...');
+            log.info('Connecting to a running Chromium instance via CDP on port 9222...');
             const browser = await chromium.connectOverCDP(CDP_ENDPOINT);
             const contexts = browser.contexts();
             if (contexts.length > 0) {
@@ -53,13 +54,12 @@ async function getContext(input: ActorInput): Promise<{ context: BrowserContext;
             const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
             return { context, persistent: false };
         } catch {
-            log.warning('CDP connection failed. Start Brave with: open -a "Brave Browser" --args --remote-debugging-port=9222');
+            log.warning('CDP connection failed. Start Chromium with --remote-debugging-port=9222, or use storage-state.json / loginMode=true instead.');
         }
 
         if (existsSync(LOCAL_STORAGE_STATE)) {
-            log.info('Using local storage-state.json (headless)');
+            log.info('Using local storage-state.json (headless, bundled Chromium)');
             const browser = await chromium.launch({
-                executablePath: BRAVE_PATH,
                 headless: true,
                 args: ['--disable-blink-features=AutomationControlled', '--disable-gpu'],
             });
@@ -70,7 +70,7 @@ async function getContext(input: ActorInput): Promise<{ context: BrowserContext;
             return { context, persistent: false };
         }
 
-        throw new Error('Cannot authenticate. Start Brave with CDP or run with loginMode=true');
+        throw new Error('Cannot authenticate. Connect a browser via CDP or run with loginMode=true');
     }
 
     log.info('Running on Apify cloud...');
@@ -113,8 +113,8 @@ async function getContext(input: ActorInput): Promise<{ context: BrowserContext;
 
 async function runLoginMode(): Promise<void> {
     log.info('=== LOGIN MODE ===');
+    log.info('Launching bundled Chromium for manual login...');
     const browser = await chromium.launch({
-        executablePath: Actor.isAtHome() ? undefined : BRAVE_PATH,
         headless: false,
         args: ['--disable-blink-features=AutomationControlled'],
     });
@@ -219,6 +219,234 @@ async function searchAndClickLead(page: Page, leadName: string): Promise<boolean
     return true;
 }
 
+interface ScrollMetrics {
+    ok: boolean;
+    target: 'container' | 'window' | 'none';
+    hint: string;
+    scrollTop: number;
+    scrollHeight: number;
+    clientHeight: number;
+    atBottom: boolean;
+}
+
+/**
+ * Resolves the element that ACTUALLY scrolls the conversation, then acts on it.
+ *
+ * Everything runs in one page.evaluate so the resolver lives in a single place.
+ * The chosen element is tagged with SCROLL_CONTAINER_ATTR so every later call
+ * keeps scrolling the same element instead of re-guessing (and possibly picking
+ * a different, non-scrollable wrapper) each time.
+ *
+ * modes: 'measure' = read position only, 'bottom' = jump to the end,
+ *        'up' = step up roughly one viewport (used when hunting for the message).
+ */
+async function conversationScroll(page: Page, mode: 'measure' | 'bottom' | 'up'): Promise<ScrollMetrics> {
+    return page.evaluate(({ mode, attr, tolerance }) => {
+        const isScrollable = (el: Element): boolean => {
+            const style = window.getComputedStyle(el);
+            const oy = style.overflowY;
+            if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return false;
+            return el.scrollHeight - el.clientHeight > 40;
+        };
+
+        const describe = (el: Element): string => {
+            const id = el.id ? `#${el.id}` : '';
+            const cls = (el.getAttribute('class') || '').trim().split(/\s+/).slice(0, 3).join('.');
+            return `${el.tagName.toLowerCase()}${id}${cls ? '.' + cls : ''}`;
+        };
+
+        const resolve = (): HTMLElement | null => {
+            // Reuse the element already tagged on a previous call, if still usable.
+            const tagged = document.querySelector(`[${attr}="1"]`) as HTMLElement | null;
+            if (tagged && tagged.isConnected && tagged.scrollHeight - tagged.clientHeight > 40) return tagged;
+            if (tagged) tagged.removeAttribute(attr);
+
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+            const candidates: { el: HTMLElement; rect: DOMRect }[] = [];
+
+            for (const el of Array.from(document.querySelectorAll<HTMLElement>('div, section, main, ul, ol'))) {
+                if (!isScrollable(el)) continue;
+                const rect = el.getBoundingClientRect();
+                // Ignore narrow rails, collapsed panes and off-screen nodes.
+                if (rect.width < 320 || rect.height < 200) continue;
+                if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+                candidates.push({ el, rect });
+            }
+
+            const scoreOf = (el: HTMLElement, rect: DOMRect): number => {
+                const hay = `${el.getAttribute('class') || ''} ${el.id || ''}`;
+                // Deliberately scored on size and content, NOT on how far the
+                // element scrolls: the contacts rail often scrolls much further
+                // than a short conversation and would otherwise win every time.
+                let score = rect.width * rect.height;
+                // A conversation/message list is what we want...
+                if (/conversation|message|chat|thread|activity|timeline/i.test(hay)) score *= 8;
+                // ...a sidebar, nav or search dropdown is what we keep mistaking it for.
+                if (/sidebar|side-bar|nav|menu|dropdown|search|modal|tooltip/i.test(hay)) score *= 0.05;
+                // Message-shaped children are the strongest signal of the real thread.
+                const msgLike = el.querySelectorAll(
+                    '[class*="message"], [class*="msg"], [class*="bubble"], [class*="activity"], [class*="event"]'
+                ).length;
+                score *= 1 + Math.min(msgLike, 40) / 4;
+                return score;
+            };
+
+            const pick = (pool: { el: HTMLElement; rect: DOMRect }[]): HTMLElement | null => {
+                let best: HTMLElement | null = null;
+                let bestScore = -1;
+                for (const { el, rect } of pool) {
+                    const score = scoreOf(el, rect);
+                    // Tie-break on scroll depth only when scores are equal.
+                    if (score > bestScore || (score === bestScore && best &&
+                        el.scrollHeight - el.clientHeight > best.scrollHeight - best.clientHeight)) {
+                        bestScore = score;
+                        best = el;
+                    }
+                }
+                return best;
+            };
+
+            // Pass 1: the main content column only.
+            const wide = candidates.filter(c => c.rect.width >= viewportWidth * 0.4);
+            // Pass 2 relaxes the width gate for narrow layouts, but only for
+            // elements that actually hold message-shaped children — otherwise a
+            // short conversation makes us "scroll" the contacts rail instead.
+            const narrowButMessagey = candidates.filter(c => c.el.querySelectorAll(
+                '[class*="message"], [class*="msg"], [class*="bubble"], [class*="activity"], [class*="event"]'
+            ).length >= 3);
+            const pool = wide.length ? wide : narrowButMessagey;
+            const best = pool.length ? pick(pool) : null;
+
+            if (best) best.setAttribute(attr, '1');
+            return best;
+        };
+
+        const el = resolve();
+
+        if (el) {
+            if (mode === 'bottom') {
+                el.scrollTop = el.scrollHeight;
+            } else if (mode === 'up') {
+                el.scrollTop = Math.max(0, el.scrollTop - Math.round(el.clientHeight * 0.8));
+            }
+            return {
+                ok: true,
+                target: 'container' as const,
+                hint: describe(el),
+                scrollTop: el.scrollTop,
+                scrollHeight: el.scrollHeight,
+                clientHeight: el.clientHeight,
+                atBottom: el.scrollHeight - el.scrollTop - el.clientHeight <= tolerance,
+            };
+        }
+
+        // Fallback: the page itself is the scroller.
+        const doc = document.scrollingElement || document.documentElement;
+        const canScrollWindow = doc.scrollHeight - doc.clientHeight > 40;
+        if (canScrollWindow) {
+            if (mode === 'bottom') {
+                window.scrollTo(0, doc.scrollHeight);
+            } else if (mode === 'up') {
+                window.scrollBy(0, -Math.round(doc.clientHeight * 0.8));
+            }
+            return {
+                ok: true,
+                target: 'window' as const,
+                hint: 'window',
+                scrollTop: doc.scrollTop,
+                scrollHeight: doc.scrollHeight,
+                clientHeight: doc.clientHeight,
+                atBottom: doc.scrollHeight - doc.scrollTop - doc.clientHeight <= tolerance,
+            };
+        }
+
+        return {
+            ok: false,
+            target: 'none' as const,
+            hint: '',
+            scrollTop: 0,
+            scrollHeight: 0,
+            clientHeight: 0,
+            atBottom: false,
+        };
+    }, { mode, attr: SCROLL_CONTAINER_ATTR, tolerance: BOTTOM_TOLERANCE_PX });
+}
+
+/**
+ * Nudges the conversation with real input events. GHL's message list is
+ * virtualised and sometimes only fetches the next page on a genuine wheel /
+ * keyboard event rather than on a programmatic scrollTop assignment.
+ */
+async function nudgeScroll(page: Page): Promise<void> {
+    try {
+        const box = await page.locator(`[${SCROLL_CONTAINER_ATTR}="1"]`).first().boundingBox({ timeout: 2000 });
+        if (box) {
+            await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+            await page.mouse.wheel(0, 4000);
+            await page.waitForTimeout(250);
+            await page.keyboard.press('End').catch(() => { /* focus may be elsewhere */ });
+        }
+    } catch { /* nudging is best-effort */ }
+}
+
+/**
+ * Scrolls the conversation to the very end and keeps going until the thread
+ * stops growing. Returns true only if we can prove we finished at the bottom.
+ *
+ * The thread grows while we scroll (lazy-loaded messages, images resizing,
+ * incoming activity), so a single scrollTop = scrollHeight is not enough: it
+ * lands at what was the bottom a moment ago. We therefore re-assert the bottom
+ * until both the height and the position hold steady across several rounds.
+ */
+async function scrollConversationToBottom(page: Page, label = 'conversation'): Promise<boolean> {
+    const deadline = Date.now() + (Actor.isAtHome() ? 45000 : 30000);
+    let lastHeight = -1;
+    let stableRounds = 0;
+    let nudged = false;
+    let metrics: ScrollMetrics | null = null;
+
+    for (let round = 0; Date.now() < deadline; round++) {
+        metrics = await conversationScroll(page, 'bottom');
+
+        if (!metrics.ok) {
+            // Nothing scrolls: the thread already fits on screen, so we are at its end.
+            log.info(`${label} has no scrollable container — already showing the whole thread.`);
+            return true;
+        }
+
+        if (metrics.atBottom && metrics.scrollHeight === lastHeight) {
+            stableRounds++;
+            // Three quiet rounds in a row: the thread has finished loading.
+            if (stableRounds >= 3) {
+                log.info(`Scrolled ${label} to bottom (${metrics.hint}, height ${metrics.scrollHeight}px, ${round + 1} rounds).`);
+                return true;
+            }
+        } else {
+            stableRounds = 0;
+        }
+
+        // Programmatic scrolling alone did not reach the end — use real input.
+        if (!metrics.atBottom && round >= 5 && !nudged) {
+            log.info(`${label} still not at bottom after ${round + 1} rounds — nudging with wheel/End.`);
+            await nudgeScroll(page);
+            nudged = true;
+        }
+
+        lastHeight = metrics.scrollHeight;
+        await page.waitForTimeout(400);
+    }
+
+    const reached = metrics?.atBottom ?? false;
+    const detail = `scrollTop=${metrics?.scrollTop}, scrollHeight=${metrics?.scrollHeight}`;
+    if (reached) {
+        // At the end, but the thread was still growing when time ran out.
+        log.info(`Reached bottom of ${label} but it never settled (${detail}).`);
+    } else {
+        log.warning(`Timed out scrolling ${label} to bottom (${detail}).`);
+    }
+    return reached;
+}
+
 async function findAppointmentCreated(page: Page, leadName: string): Promise<{ found: boolean; screenshotUrl: string | null }> {
     log.info('Waiting for conversation to load...');
 
@@ -231,24 +459,26 @@ async function findAppointmentCreated(page: Page, leadName: string): Promise<{ f
         '[class*="conversation"]',
     ];
 
-    let panelSelector = '';
     const maxWait = Actor.isAtHome() ? 60000 : 15000;
     const deadline = Date.now() + maxWait;
+    let panelPresent = false;
+    let container: ScrollMetrics | null = null;
 
+    // Gate on the conversation existing at all. Whether it SCROLLS is a separate
+    // question: a short thread that fits on screen is perfectly valid.
     while (Date.now() < deadline) {
         for (const sel of panelSelectors) {
             if (await page.locator(sel).count() > 0) {
-                panelSelector = sel;
+                panelPresent = true;
                 break;
             }
         }
-        if (panelSelector) break;
+        container = await conversationScroll(page, 'measure');
+        if (panelPresent || container.ok) break;
         await page.waitForTimeout(1000);
     }
 
-    if (panelSelector) {
-        log.info(`Conversation panel found: ${panelSelector}`);
-    } else {
+    if (!panelPresent && !container?.ok) {
         log.warning('No conversation panel found after waiting.');
         if (Actor.isAtHome()) {
             const store = await Actor.openKeyValueStore();
@@ -257,108 +487,94 @@ async function findAppointmentCreated(page: Page, leadName: string): Promise<{ f
         return { found: false, screenshotUrl: null };
     }
 
+    log.info(container?.ok
+        ? `Conversation scroll container found: ${container.hint} (${container.target})`
+        : 'Conversation panel found; it does not scroll (thread fits on screen).');
+
     // Close activity panel for more conversation space
     try {
         const closeBtn = page.locator('#close-panel-button, #close-pannel-button');
         if (await closeBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
             await closeBtn.click();
             log.info('Activity panel closed.');
-            await page.waitForTimeout(500);
+            await page.waitForTimeout(800);
         }
     } catch { /* panel may not exist */ }
 
-    // Search for appointment text patterns
+    // Closing the panel reflows the page, so drop the tag and re-resolve the
+    // container against the new layout before scrolling.
+    await page.evaluate((attr) => {
+        document.querySelector(`[${attr}="1"]`)?.removeAttribute(attr);
+    }, SCROLL_CONTAINER_ATTR);
+    await conversationScroll(page, 'measure');
+
+    // Always land at the end of the chat first — the appointment message is the
+    // latest activity, and the screenshot must show the bottom of the thread.
+    await scrollConversationToBottom(page);
+
     const searchPatterns = [
         `Appointment ${leadName} created`,
         `Appointment ${leadName.split(' ')[0]} created`,
         'Appointment',
     ];
 
-    // Check if any appointment text already visible
-    let appointmentLocator = null;
-    for (const pattern of searchPatterns) {
-        const loc = page.getByText(pattern, { exact: false });
-        const count = await loc.count();
-        if (count > 0) {
-            log.info(`Found "${pattern}" in DOM (${count} matches)`);
-            appointmentLocator = loc.first();
-            break;
+    const matchCount = async (): Promise<string | null> => {
+        for (const pattern of searchPatterns) {
+            const count = await page.getByText(pattern, { exact: false }).count();
+            if (count > 0) {
+                log.info(`Found "${pattern}" in DOM (${count} matches)`);
+                return pattern;
+            }
         }
-    }
+        return null;
+    };
 
-    // If not found, scroll to find it
-    if (!appointmentLocator) {
-        log.info('Scrolling to find appointment message...');
-        const panel = page.locator(panelSelector).first();
-        let found = false;
+    let found = (await matchCount()) !== null;
 
-        // Scroll UP first (recent activity usually above)
-        for (let i = 0; i < 20; i++) {
-            await panel.evaluate((el) => el.scrollBy(0, -500));
+    // Not at the end of the thread? Walk back up to confirm whether it exists at
+    // all, then return to the bottom for the screenshot.
+    if (!found) {
+        log.info('Appointment message not present at bottom — scanning upwards...');
+        for (let i = 0; i < 30; i++) {
+            const m = await conversationScroll(page, 'up');
             await page.waitForTimeout(400);
-            for (const pattern of searchPatterns) {
-                if (await page.getByText(pattern, { exact: false }).count() > 0) {
-                    appointmentLocator = page.getByText(pattern, { exact: false }).first();
-                    found = true;
-                    log.info(`Found "${pattern}" after scrolling up ${i + 1} times`);
-                    break;
-                }
+            if (await matchCount()) {
+                found = true;
+                log.info(`Found appointment message after scrolling up ${i + 1} times.`);
+                break;
             }
-            if (found) break;
-        }
-
-        if (!found) {
-            // Reset and scroll down
-            await panel.evaluate((el) => el.scrollTop = 0);
-            await page.waitForTimeout(300);
-            for (let i = 0; i < 30; i++) {
-                await panel.evaluate((el) => el.scrollBy(0, 500));
-                await page.waitForTimeout(400);
-                for (const pattern of searchPatterns) {
-                    if (await page.getByText(pattern, { exact: false }).count() > 0) {
-                        appointmentLocator = page.getByText(pattern, { exact: false }).first();
-                        found = true;
-                        log.info(`Found "${pattern}" after scrolling down ${i + 1} times`);
-                        break;
-                    }
-                }
-                if (found) break;
+            if (m.scrollTop <= 0) {
+                log.info('Reached top of conversation.');
+                break;
             }
         }
 
         if (!found) {
-            log.warning('No appointment message found after scrolling.');
-            return { found: false, screenshotUrl: null };
+            log.warning('No appointment message found in the conversation.');
         }
+
+        // Whatever the scan found, the screenshot belongs at the end of the chat.
+        log.info('Returning to bottom of conversation...');
+        await scrollConversationToBottom(page);
     }
 
-    // Position element at ~40% from top of panel viewport using precise scroll math
-    const panel = page.locator(panelSelector).first();
-    try {
-        const elHandle = await appointmentLocator!.elementHandle({ timeout: 5000 });
-        if (elHandle) {
-            await panel.evaluate((container, el) => {
-                const containerRect = container.getBoundingClientRect();
-                const elRect = (el as any).getBoundingClientRect();
-                const elOffsetInContainer = elRect.top - containerRect.top + container.scrollTop;
-                const targetScroll = elOffsetInContainer - (container.clientHeight * 0.4);
-                container.scrollTop = Math.max(0, targetScroll);
-            }, elHandle);
-            await elHandle.dispose();
-        } else {
-            await appointmentLocator!.scrollIntoViewIfNeeded({ timeout: 5000 });
-        }
-    } catch {
-        try { await appointmentLocator!.scrollIntoViewIfNeeded({ timeout: 5000 }); } catch { /* proceed */ }
-    }
-    await page.waitForTimeout(800);
-    log.info('Appointment message positioned in viewport.');
+    if (!found) return { found: false, screenshotUrl: null };
 
-    // Take screenshot
+    // Take screenshot — re-assert the bottom immediately before each attempt so
+    // late-arriving content can never leave us parked mid-thread.
     let screenshotUrl: string | null = null;
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
             if (attempt > 0) await page.waitForTimeout(2000);
+
+            const atBottom = await scrollConversationToBottom(page);
+            await page.waitForTimeout(500);
+            const final = await conversationScroll(page, 'measure');
+            log.info(
+                `Capturing at scrollTop=${final.scrollTop}/${final.scrollHeight} ` +
+                `(atBottom=${final.atBottom || atBottom})`
+            );
+
             const screenshot = await page.screenshot({ type: 'jpeg', quality: 75, timeout: 30000 });
             const store = await Actor.openKeyValueStore();
             await store.setValue('appointment-screenshot', screenshot, { contentType: 'image/jpeg' });

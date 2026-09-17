@@ -8,7 +8,7 @@
 	},
 	"dependencies": {
 		"apify": "^3.7.0",
-		"playwright": "^1.52.0"
+		"playwright": "1.63.0"
 	},
 	"devDependencies": {
 		"@apify/tsconfig": "^0.2.0",
