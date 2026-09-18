@@ -617,11 +617,37 @@ try {
     log.info('Navigating to sub-account...');
     await page.goto(input.subAccountUrl, { waitUntil: 'load', timeout: 120000 });
 
-    // Detect login page
-    const loginDetected = await page.locator('input[type="email"], input[type="password"], button:has-text("Login"), button:has-text("Sign in")').first().isVisible({ timeout: 5000 }).catch(() => false);
+    // Detect login/logout vs. dashboard by polling both outcomes instead of a
+    // single 5s check followed by a blind 90s x 2 dashboard wait. GHL's dead-
+    // session redirect is a CLIENT-SIDE navigation that fires after this page's
+    // own "load" event, and it can land on a URL like "/?logout=true" — logout
+    // as a query param, not a "/logout" path segment — so a single point-in-time
+    // check plus a narrow URL substring match both used to miss it and fall
+    // through into wasted minutes of timeouts. Polling with short, independent
+    // isVisible() checks (instead of one long-lived waitForSelector) also
+    // survives that mid-flight client-side redirect without erroring out.
+    const dashboardSelector = '#globalSearchOpener';
+    const loginSelector = 'input[type="email"], input[type="password"], button:has-text("Login"), button:has-text("Sign in")';
+    const loggedOutUrl = (url: string) => /[/?&](login|logout|oauth)(\/|$|[=&?])/.test(url);
 
-    if (loginDetected || page.url().includes('/login') || page.url().includes('/oauth')) {
-        log.warning('Session expired — login page detected.');
+    async function detectAuthState(maxWaitMs: number): Promise<'dashboard' | 'login' | 'unknown'> {
+        const deadline = Date.now() + maxWaitMs;
+        while (Date.now() < deadline) {
+            const [hasDashboard, hasLogin] = await Promise.all([
+                page.locator(dashboardSelector).first().isVisible().catch(() => false),
+                page.locator(loginSelector).first().isVisible().catch(() => false),
+            ]);
+            if (hasDashboard) return 'dashboard';
+            if (hasLogin) return 'login';
+            await page.waitForTimeout(500).catch(() => { /* page may be mid-navigation */ });
+        }
+        return loggedOutUrl(page.url()) ? 'login' : 'unknown';
+    }
+
+    const authState = await detectAuthState(20000);
+
+    if (authState === 'login') {
+        log.warning(`Session expired — login/logout detected (url: ${page.url()}).`);
         const output: ActorOutput = {
             appointmentFound: false,
             leadFound: false,
@@ -634,12 +660,17 @@ try {
         await Actor.exit();
     }
 
-    // Wait for dashboard
-    await retry(async () => {
-        await page.waitForSelector('#globalSearchOpener', { state: 'visible', timeout: 90000 });
-    }, { attempts: 2, delayMs: 5000, label: 'wait for dashboard' });
-
-    log.info('Dashboard loaded.');
+    if (authState === 'dashboard') {
+        log.info('Dashboard loaded.');
+    } else {
+        // Genuinely ambiguous after 20s of polling — fall back to the longer
+        // retried wait as a safety net rather than guessing either way.
+        log.info('Auth state unclear after 20s — falling back to dashboard wait/retry.');
+        await retry(async () => {
+            await page.waitForSelector(dashboardSelector, { state: 'visible', timeout: 90000 });
+        }, { attempts: 2, delayMs: 5000, label: 'wait for dashboard' });
+        log.info('Dashboard loaded.');
+    }
 
     const leadFound = await searchAndClickLead(page, input.leadName);
 
