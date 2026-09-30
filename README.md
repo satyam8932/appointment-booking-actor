@@ -4,7 +4,7 @@ Verifies appointment booking in GoHighLevel by finding "Appointment [Lead Name] 
 
 ## Actor IDs
 
-- **Actor ID:** `43L8lc3WSCJ88Frz5`
+- **Actor ID:** `MS7VfnYXeufWQXMb9`
 - **Platform:** Apify Cloud
 
 ## Setup
@@ -37,6 +37,9 @@ Both actors share the same GHL session so you only need to login once from eithe
 echo '{"subAccountUrl": "https://app.tjbdigitalservices.com/v2/location/LOCATION_ID/dashboard", "leadName": "Lead Name"}' > storage/key_value_stores/default/INPUT.json
 
 npx tsx src/main.ts
+
+# Or watch the browser while it runs
+HEADLESS=false npx tsx src/main.ts
 ```
 
 ## Run on Cloud (API call)
@@ -82,7 +85,7 @@ apify builds add-tag -b BUILD_ID -t latest
 ## How it works
 
 1. Navigates to sub-account dashboard
-2. Searches lead via global search (smart name matching, skips duplicates with "(2)" suffix)
+2. Searches lead via global search: types the full name, selects the "Contacts" pill, waits for the results to settle, then opens the exact match (else the top-most row containing the name, skipping duplicates with a "(2)" suffix). GHL's "No results" state returns `leadFound: false`
 3. Opens lead conversation
 4. Closes activity sidebar panel
 5. Detects the element that actually scrolls the conversation (see below)

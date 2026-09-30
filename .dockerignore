@@ -1,0 +1,8 @@
+node_modules
+dist
+storage
+apify_storage
+storage-state.json
+tsconfig.tsbuildinfo
+debug-*.png
+.git

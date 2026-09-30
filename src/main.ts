@@ -23,17 +23,14 @@ const CDP_ENDPOINT = 'http://127.0.0.1:9222';
 const SCROLL_CONTAINER_ATTR = 'data-appt-scroll-container';
 const BOTTOM_TOLERANCE_PX = 8;
 
-async function retry<T>(
-    fn: () => Promise<T>,
-    { attempts = 3, delayMs = 1000, label = 'operation' } = {}
-): Promise<T> {
+async function retry<T>(fn: () => Promise<T>, { attempts = 3, delayMs = 1000, label = 'operation' } = {}): Promise<T> {
     for (let i = 0; i < attempts; i++) {
         try {
             return await fn();
         } catch (err: any) {
             if (i === attempts - 1) throw err;
             log.warning(`${label} failed (attempt ${i + 1}/${attempts}): ${err.message}. Retrying in ${delayMs}ms...`);
-            await new Promise(r => setTimeout(r, delayMs));
+            await new Promise((r) => setTimeout(r, delayMs));
             delayMs *= 2;
         }
     }
@@ -54,13 +51,17 @@ async function getContext(input: ActorInput): Promise<{ context: BrowserContext;
             const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
             return { context, persistent: false };
         } catch {
-            log.warning('CDP connection failed. Start Chromium with --remote-debugging-port=9222, or use storage-state.json / loginMode=true instead.');
+            log.warning(
+                'CDP connection failed. Start Chromium with --remote-debugging-port=9222, or use storage-state.json / loginMode=true instead.',
+            );
         }
 
         if (existsSync(LOCAL_STORAGE_STATE)) {
-            log.info('Using local storage-state.json (headless, bundled Chromium)');
+            // HEADLESS=false shows the browser, to watch a local run.
+            const headless = process.env.HEADLESS !== 'false';
+            log.info(`Using local storage-state.json (${headless ? 'headless' : 'headed'}, bundled Chromium)`);
             const browser = await chromium.launch({
-                headless: true,
+                headless,
                 args: ['--disable-blink-features=AutomationControlled', '--disable-gpu'],
             });
             const context = await browser.newContext({
@@ -123,10 +124,13 @@ async function runLoginMode(): Promise<void> {
     await page.goto('https://app.tjbdigitalservices.com/');
 
     log.info('Waiting for login... will save session once you reach any dashboard.');
-    await page.waitForURL(url => {
-        const path = new URL(url).pathname;
-        return path.includes('/dashboard') || path.includes('/v2/location') || path.includes('/agency_dashboard');
-    }, { timeout: 300000 });
+    await page.waitForURL(
+        (url) => {
+            const path = new URL(url).pathname;
+            return path.includes('/dashboard') || path.includes('/v2/location') || path.includes('/agency_dashboard');
+        },
+        { timeout: 300000 },
+    );
 
     const state = await context.storageState();
     writeFileSync(LOCAL_STORAGE_STATE, JSON.stringify(state, null, 2));
@@ -136,86 +140,220 @@ async function runLoginMode(): Promise<void> {
     log.info('Login mode complete.');
 }
 
-async function searchAndClickLead(page: Page, leadName: string): Promise<boolean> {
-    await page.waitForSelector('#globalSearchOpener', { state: 'visible', timeout: 60000 });
-    await page.waitForTimeout(1000);
+// GHL global search v2 ("gs2"): one popup that mixes every category, with a
+// row of category pills (All, Contacts, Opportunities, ...) above the results.
+const SEARCH_OPENER = '#globalSearchOpener';
+const SEARCH_INPUT = 'input[role="combobox"][aria-controls^="gs2-panel"], #global-search-input';
+const SEARCH_BODY = '.gs2-body[role="region"], [id^="gs2-panel-"][role="region"]';
+const SEARCH_PILL = 'button.gs2-apps-pill[role="tab"]';
+const RESULT_ROW = '[role="option"]';
+const RESULT_TITLE = '.v2-result-row__title-text, .v2-result-row__title';
+const SEARCH_NO_RESULTS = '.gs2-no-results__header-text, .gs2-no-results__section-label';
 
-    await retry(async () => {
-        log.info('Clicking global search...');
-        await page.locator('#globalSearchOpener').click();
-        await page.waitForTimeout(1000);
-        await page.locator('#global-search-input').waitFor({ state: 'visible', timeout: 15000 });
-    }, { attempts: 3, delayMs: 2000, label: 'open search popup' });
+const normalizeName = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
+
+async function openGlobalSearch(page: Page): Promise<void> {
+    const input = page.locator(SEARCH_INPUT).first();
+    if (await input.isVisible().catch(() => false)) return;
+
+    await retry(
+        async () => {
+            log.info('Opening global search...');
+            const opener = page.locator(SEARCH_OPENER).first();
+            if (await opener.isVisible().catch(() => false)) {
+                await opener.click();
+            } else {
+                // The popup also opens with the Cmd/Ctrl+K shortcut.
+                await page.keyboard.press(process.platform === 'darwin' ? 'Meta+k' : 'Control+k');
+            }
+            await input.waitFor({ state: 'visible', timeout: 15000 });
+        },
+        { attempts: 3, delayMs: 2000, label: 'open search popup' },
+    );
+}
+
+/**
+ * Reads the visible result rows once they stop changing. The popup re-renders
+ * while the query debounces and again after a pill is clicked, so a single
+ * read can catch results for a half-typed name or the previous tab.
+ * Contact rows are preferred: in the "All" tab they sit in a group labelled
+ * "Contacts", and after the Contacts pill is selected they are the only rows.
+ */
+async function readStableResults(page: Page, timeoutMs = 15000): Promise<string[]> {
+    const deadline = Date.now() + timeoutMs;
+    let last = '';
+    let stableRounds = 0;
+    let snapshot = { noResults: false, titles: [] as string[] };
+
+    while (Date.now() < deadline) {
+        snapshot = await page
+            .evaluate(
+                ({ bodySel, rowSel, titleSel, noResultsSel }) => {
+                    // Inline callbacks only: tsx wraps named functions in a __name()
+                    // helper that does not exist inside the browser.
+                    const body = Array.from(document.querySelectorAll(bodySel)).find(
+                        (el) => (el as HTMLElement).offsetParent !== null,
+                    );
+                    if (!body) return { noResults: false, titles: [] as string[] };
+                    // "No results" still renders "Ask AI" / "Add Contact" rows, so it
+                    // has to be checked before the rows are read.
+                    const empty = body.querySelector(noResultsSel) as HTMLElement | null;
+                    if (empty && empty.offsetParent !== null) return { noResults: true, titles: [] as string[] };
+                    const scope = body.querySelector('[role="group"][aria-label="Contacts" i]') || body;
+                    const titles = Array.from(scope.querySelectorAll(rowSel))
+                        .filter((el) => (el as HTMLElement).offsetParent !== null)
+                        .map((row) => ((row.querySelector(titleSel) as HTMLElement | null)?.innerText || '').trim());
+                    return { noResults: false, titles };
+                },
+                { bodySel: SEARCH_BODY, rowSel: RESULT_ROW, titleSel: RESULT_TITLE, noResultsSel: SEARCH_NO_RESULTS },
+            )
+            // A re-render mid-read can destroy the evaluate context; keep the last snapshot and poll again.
+            .catch(() => snapshot);
+
+        const key = JSON.stringify(snapshot);
+        if (key === last) {
+            stableRounds++;
+            // The empty state can flash while the query debounces, so it must
+            // hold for a few rounds before it counts as "lead not found".
+            if (snapshot.noResults && stableRounds >= 3) {
+                log.info('Search shows "No results".');
+                return [];
+            }
+            if (stableRounds >= 2 && (snapshot.titles.length > 0 || stableRounds >= 6)) return snapshot.titles;
+        } else {
+            stableRounds = 0;
+            last = key;
+        }
+        await page.waitForTimeout(500);
+    }
+    return snapshot.titles;
+}
+
+/** Same scoping as readStableResults, as a locator so rows can be clicked. */
+async function resultRows(page: Page) {
+    const body = page.locator(SEARCH_BODY).filter({ visible: true }).first();
+    const group = body.locator('[role="group"][aria-label="Contacts" i]').first();
+    const scope = (await group.count()) > 0 ? group : body;
+    return scope.locator(RESULT_ROW).filter({ visible: true });
+}
+
+async function selectContactsPill(page: Page): Promise<boolean> {
+    const pill = page
+        .locator(SEARCH_PILL)
+        .filter({ has: page.locator('.gs2-apps-pill__label', { hasText: /^\s*Contacts\s*$/i }) })
+        .first();
+    try {
+        await pill.waitFor({ state: 'visible', timeout: 10000 });
+        if ((await pill.getAttribute('aria-selected')) !== 'true') {
+            log.info('Selecting "Contacts" pill...');
+            await pill.click();
+        }
+        await page.waitForFunction((el) => el?.getAttribute('aria-selected') === 'true', await pill.elementHandle(), {
+            timeout: 5000,
+        });
+        return true;
+    } catch (err: any) {
+        log.warning(`Could not select Contacts pill (${err.message}) — falling back to the Contacts group in "All".`);
+        return false;
+    }
+}
+
+/**
+ * Picks the row to open: an exact name match first, then the top-most row that
+ * contains the full name, then the top-most row that contains every word of it.
+ * Rows ending in a "(2)"-style duplicate marker are skipped unless nothing else
+ * matches. Returns -1 when no row matches the lead at all.
+ */
+function pickBestResult(titles: string[], leadName: string): number {
+    const target = normalizeName(leadName);
+    const words = target.split(' ');
+    const isDuplicate = (t: string) => /\(\d+\)/.test(t);
+
+    const exact = titles.findIndex((t) => normalizeName(t) === target);
+    if (exact !== -1) return exact;
+
+    const tiers = [
+        (t: string) => normalizeName(t).includes(target),
+        (t: string) => words.every((w) => normalizeName(t).split(' ').includes(w)),
+    ];
+    for (const matches of tiers) {
+        const clean = titles.findIndex((t) => matches(t) && !isDuplicate(t));
+        if (clean !== -1) return clean;
+        const any = titles.findIndex((t) => matches(t));
+        if (any !== -1) return any;
+    }
+    return -1;
+}
+
+async function searchAndClickLead(page: Page, leadName: string): Promise<boolean> {
+    await page.waitForTimeout(1000);
+    await openGlobalSearch(page);
 
     log.info('Search popup visible, typing lead name...');
-    await page.click('#global-search-input');
+    const input = page.locator(SEARCH_INPUT).first();
+    await input.click();
+    await input.fill('');
     await page.keyboard.type(leadName, { delay: 30 });
 
     log.info('Waiting for search results...');
-    await page.waitForTimeout(3500);
+    await page.waitForTimeout(1500);
+    const pillSelected = await selectContactsPill(page);
 
-    const noResult = page.getByText('No matching result', { exact: false });
-    if (await noResult.count() > 0 && await noResult.first().isVisible()) {
-        log.warning(`Lead not found: "${leadName}" — no matching result.`);
+    const titles = await readStableResults(page);
+    titles.forEach((t, i) => log.info(`Search result [${i}]: "${t.substring(0, 60)}"`));
+
+    if (titles.length === 0) {
+        const note = pillSelected ? '' : ' (Contacts pill not selected)';
+        log.warning(`Lead not found: "${leadName}" — no contact results${note}.`);
         return false;
     }
 
-    async function findBestResult(): Promise<{ found: boolean; index: number }> {
-        const allMatches = page.getByText(leadName, { exact: false });
-        const count = await allMatches.count();
-        if (count === 0) return { found: false, index: -1 };
-
-        let bestIndex = 0;
-        for (let i = 0; i < count; i++) {
-            const el = allMatches.nth(i);
-            if (!await el.isVisible().catch(() => false)) continue;
-            const text = (await el.innerText().catch(() => '') || '').trim();
-            log.info(`Search result [${i}]: "${text.substring(0, 60)}"`);
-            const firstLine = text.split('\n')[0].trim();
-            if (firstLine === leadName) {
-                log.info(`Exact match found at index ${i}`);
-                return { found: true, index: i };
-            }
-            if (/\(\d+\)/.test(firstLine)) {
-                log.info(`Skipping duplicate indicator: "${firstLine}"`);
-                continue;
-            }
-            bestIndex = i;
-        }
-        return { found: true, index: bestIndex };
-    }
-
-    const { found: resultFound, index: bestIdx } = await findBestResult();
-    if (!resultFound) {
-        log.warning(`Lead not found: "${leadName}" — no result appeared.`);
+    const bestIdx = pickBestResult(titles, leadName);
+    if (bestIdx === -1) {
+        log.warning(`Lead not found: "${leadName}" — no contact result matches the name.`);
         return false;
     }
+    log.info(`Best match at index ${bestIdx}: "${titles[bestIdx]}"`);
 
-    await retry(async () => {
-        const allResults = page.getByText(leadName, { exact: false });
-        const target = allResults.nth(bestIdx);
-        await target.waitFor({ state: 'visible', timeout: 15000 });
-        log.info(`Clicking search result at index ${bestIdx}...`);
-        await target.click();
-        await page.waitForTimeout(2000);
+    const startUrl = page.url();
+    await retry(
+        async () => {
+            const row = (await resultRows(page)).nth(bestIdx);
+            await row.waitFor({ state: 'visible', timeout: 15000 });
+            const rowTitle = (
+                await row
+                    .locator(RESULT_TITLE)
+                    .first()
+                    .innerText()
+                    .catch(() => '')
+            ).trim();
+            if (normalizeName(rowTitle) !== normalizeName(titles[bestIdx])) {
+                throw new Error(`Result list changed before click (expected "${titles[bestIdx]}", saw "${rowTitle}")`);
+            }
 
-        const url = page.url();
-        if (url.includes('/dashboard') && !url.includes('/contacts/')) {
-            const parentItem = page.locator('.search-item, .hl_contact-search-result, [class*="search-result"]').first();
-            if (await parentItem.count() > 0) {
-                await parentItem.click();
-                await page.waitForTimeout(1500);
-            } else {
+            log.info(`Clicking search result at index ${bestIdx}...`);
+            // Click the name, not the row's "Open in new tab" / "Copy URL" buttons.
+            await row.locator(RESULT_TITLE).first().click();
+            const navigated = await page
+                .waitForURL((url) => url.toString() !== startUrl, { timeout: 8000 })
+                .then(
+                    () => true,
+                    () => false,
+                );
+
+            if (!navigated) {
+                // Clicking marks the row as highlighted; Enter opens the highlighted row.
+                log.info('No navigation after click — pressing Enter on the highlighted row...');
+                await row.hover();
                 await page.keyboard.press('Enter');
-                await page.waitForTimeout(1500);
+                await page.waitForURL((url) => url.toString() !== startUrl, { timeout: 8000 });
             }
-            if (page.url().includes('/dashboard') && !page.url().includes('/contacts/')) {
-                throw new Error('Navigation did not happen after clicking search result');
-            }
-        }
-    }, { attempts: 2, delayMs: 3000, label: 'click search result' });
+            await page.waitForTimeout(2000);
+        },
+        { attempts: 2, delayMs: 3000, label: 'click search result' },
+    );
 
-    log.info('Lead page opened.');
+    log.info(`Lead page opened: ${page.url()}`);
     return true;
 }
 
@@ -241,135 +379,145 @@ interface ScrollMetrics {
  *        'up' = step up roughly one viewport (used when hunting for the message).
  */
 async function conversationScroll(page: Page, mode: 'measure' | 'bottom' | 'up'): Promise<ScrollMetrics> {
-    return page.evaluate(({ mode, attr, tolerance }) => {
-        const isScrollable = (el: Element): boolean => {
-            const style = window.getComputedStyle(el);
-            const oy = style.overflowY;
-            if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return false;
-            return el.scrollHeight - el.clientHeight > 40;
-        };
-
-        const describe = (el: Element): string => {
-            const id = el.id ? `#${el.id}` : '';
-            const cls = (el.getAttribute('class') || '').trim().split(/\s+/).slice(0, 3).join('.');
-            return `${el.tagName.toLowerCase()}${id}${cls ? '.' + cls : ''}`;
-        };
-
-        const resolve = (): HTMLElement | null => {
-            // Reuse the element already tagged on a previous call, if still usable.
-            const tagged = document.querySelector(`[${attr}="1"]`) as HTMLElement | null;
-            if (tagged && tagged.isConnected && tagged.scrollHeight - tagged.clientHeight > 40) return tagged;
-            if (tagged) tagged.removeAttribute(attr);
-
-            const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
-            const candidates: { el: HTMLElement; rect: DOMRect }[] = [];
-
-            for (const el of Array.from(document.querySelectorAll<HTMLElement>('div, section, main, ul, ol'))) {
-                if (!isScrollable(el)) continue;
-                const rect = el.getBoundingClientRect();
-                // Ignore narrow rails, collapsed panes and off-screen nodes.
-                if (rect.width < 320 || rect.height < 200) continue;
-                if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
-                candidates.push({ el, rect });
-            }
-
-            const scoreOf = (el: HTMLElement, rect: DOMRect): number => {
-                const hay = `${el.getAttribute('class') || ''} ${el.id || ''}`;
-                // Deliberately scored on size and content, NOT on how far the
-                // element scrolls: the contacts rail often scrolls much further
-                // than a short conversation and would otherwise win every time.
-                let score = rect.width * rect.height;
-                // A conversation/message list is what we want...
-                if (/conversation|message|chat|thread|activity|timeline/i.test(hay)) score *= 8;
-                // ...a sidebar, nav or search dropdown is what we keep mistaking it for.
-                if (/sidebar|side-bar|nav|menu|dropdown|search|modal|tooltip/i.test(hay)) score *= 0.05;
-                // Message-shaped children are the strongest signal of the real thread.
-                const msgLike = el.querySelectorAll(
-                    '[class*="message"], [class*="msg"], [class*="bubble"], [class*="activity"], [class*="event"]'
-                ).length;
-                score *= 1 + Math.min(msgLike, 40) / 4;
-                return score;
+    return page.evaluate(
+        ({ mode, attr, tolerance }) => {
+            const isScrollable = (el: Element): boolean => {
+                const style = window.getComputedStyle(el);
+                const oy = style.overflowY;
+                if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return false;
+                return el.scrollHeight - el.clientHeight > 40;
             };
 
-            const pick = (pool: { el: HTMLElement; rect: DOMRect }[]): HTMLElement | null => {
-                let best: HTMLElement | null = null;
-                let bestScore = -1;
-                for (const { el, rect } of pool) {
-                    const score = scoreOf(el, rect);
-                    // Tie-break on scroll depth only when scores are equal.
-                    if (score > bestScore || (score === bestScore && best &&
-                        el.scrollHeight - el.clientHeight > best.scrollHeight - best.clientHeight)) {
-                        bestScore = score;
-                        best = el;
-                    }
+            const describe = (el: Element): string => {
+                const id = el.id ? `#${el.id}` : '';
+                const cls = (el.getAttribute('class') || '').trim().split(/\s+/).slice(0, 3).join('.');
+                return `${el.tagName.toLowerCase()}${id}${cls ? '.' + cls : ''}`;
+            };
+
+            const resolve = (): HTMLElement | null => {
+                // Reuse the element already tagged on a previous call, if still usable.
+                const tagged = document.querySelector(`[${attr}="1"]`) as HTMLElement | null;
+                if (tagged && tagged.isConnected && tagged.scrollHeight - tagged.clientHeight > 40) return tagged;
+                if (tagged) tagged.removeAttribute(attr);
+
+                const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+                const candidates: { el: HTMLElement; rect: DOMRect }[] = [];
+
+                for (const el of Array.from(document.querySelectorAll<HTMLElement>('div, section, main, ul, ol'))) {
+                    if (!isScrollable(el)) continue;
+                    const rect = el.getBoundingClientRect();
+                    // Ignore narrow rails, collapsed panes and off-screen nodes.
+                    if (rect.width < 320 || rect.height < 200) continue;
+                    if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
+                    candidates.push({ el, rect });
                 }
+
+                const scoreOf = (el: HTMLElement, rect: DOMRect): number => {
+                    const hay = `${el.getAttribute('class') || ''} ${el.id || ''}`;
+                    // Deliberately scored on size and content, NOT on how far the
+                    // element scrolls: the contacts rail often scrolls much further
+                    // than a short conversation and would otherwise win every time.
+                    let score = rect.width * rect.height;
+                    // A conversation/message list is what we want...
+                    if (/conversation|message|chat|thread|activity|timeline/i.test(hay)) score *= 8;
+                    // ...a sidebar, nav or search dropdown is what we keep mistaking it for.
+                    if (/sidebar|side-bar|nav|menu|dropdown|search|modal|tooltip/i.test(hay)) score *= 0.05;
+                    // Message-shaped children are the strongest signal of the real thread.
+                    const msgLike = el.querySelectorAll(
+                        '[class*="message"], [class*="msg"], [class*="bubble"], [class*="activity"], [class*="event"]',
+                    ).length;
+                    score *= 1 + Math.min(msgLike, 40) / 4;
+                    return score;
+                };
+
+                const pick = (pool: { el: HTMLElement; rect: DOMRect }[]): HTMLElement | null => {
+                    let best: HTMLElement | null = null;
+                    let bestScore = -1;
+                    for (const { el, rect } of pool) {
+                        const score = scoreOf(el, rect);
+                        // Tie-break on scroll depth only when scores are equal.
+                        if (
+                            score > bestScore ||
+                            (score === bestScore &&
+                                best &&
+                                el.scrollHeight - el.clientHeight > best.scrollHeight - best.clientHeight)
+                        ) {
+                            bestScore = score;
+                            best = el;
+                        }
+                    }
+                    return best;
+                };
+
+                // Pass 1: the main content column only.
+                const wide = candidates.filter((c) => c.rect.width >= viewportWidth * 0.4);
+                // Pass 2 relaxes the width gate for narrow layouts, but only for
+                // elements that actually hold message-shaped children — otherwise a
+                // short conversation makes us "scroll" the contacts rail instead.
+                const narrowButMessagey = candidates.filter(
+                    (c) =>
+                        c.el.querySelectorAll(
+                            '[class*="message"], [class*="msg"], [class*="bubble"], [class*="activity"], [class*="event"]',
+                        ).length >= 3,
+                );
+                const pool = wide.length ? wide : narrowButMessagey;
+                const best = pool.length ? pick(pool) : null;
+
+                if (best) best.setAttribute(attr, '1');
                 return best;
             };
 
-            // Pass 1: the main content column only.
-            const wide = candidates.filter(c => c.rect.width >= viewportWidth * 0.4);
-            // Pass 2 relaxes the width gate for narrow layouts, but only for
-            // elements that actually hold message-shaped children — otherwise a
-            // short conversation makes us "scroll" the contacts rail instead.
-            const narrowButMessagey = candidates.filter(c => c.el.querySelectorAll(
-                '[class*="message"], [class*="msg"], [class*="bubble"], [class*="activity"], [class*="event"]'
-            ).length >= 3);
-            const pool = wide.length ? wide : narrowButMessagey;
-            const best = pool.length ? pick(pool) : null;
+            const el = resolve();
 
-            if (best) best.setAttribute(attr, '1');
-            return best;
-        };
-
-        const el = resolve();
-
-        if (el) {
-            if (mode === 'bottom') {
-                el.scrollTop = el.scrollHeight;
-            } else if (mode === 'up') {
-                el.scrollTop = Math.max(0, el.scrollTop - Math.round(el.clientHeight * 0.8));
+            if (el) {
+                if (mode === 'bottom') {
+                    el.scrollTop = el.scrollHeight;
+                } else if (mode === 'up') {
+                    el.scrollTop = Math.max(0, el.scrollTop - Math.round(el.clientHeight * 0.8));
+                }
+                return {
+                    ok: true,
+                    target: 'container' as const,
+                    hint: describe(el),
+                    scrollTop: el.scrollTop,
+                    scrollHeight: el.scrollHeight,
+                    clientHeight: el.clientHeight,
+                    atBottom: el.scrollHeight - el.scrollTop - el.clientHeight <= tolerance,
+                };
             }
-            return {
-                ok: true,
-                target: 'container' as const,
-                hint: describe(el),
-                scrollTop: el.scrollTop,
-                scrollHeight: el.scrollHeight,
-                clientHeight: el.clientHeight,
-                atBottom: el.scrollHeight - el.scrollTop - el.clientHeight <= tolerance,
-            };
-        }
 
-        // Fallback: the page itself is the scroller.
-        const doc = document.scrollingElement || document.documentElement;
-        const canScrollWindow = doc.scrollHeight - doc.clientHeight > 40;
-        if (canScrollWindow) {
-            if (mode === 'bottom') {
-                window.scrollTo(0, doc.scrollHeight);
-            } else if (mode === 'up') {
-                window.scrollBy(0, -Math.round(doc.clientHeight * 0.8));
+            // Fallback: the page itself is the scroller.
+            const doc = document.scrollingElement || document.documentElement;
+            const canScrollWindow = doc.scrollHeight - doc.clientHeight > 40;
+            if (canScrollWindow) {
+                if (mode === 'bottom') {
+                    window.scrollTo(0, doc.scrollHeight);
+                } else if (mode === 'up') {
+                    window.scrollBy(0, -Math.round(doc.clientHeight * 0.8));
+                }
+                return {
+                    ok: true,
+                    target: 'window' as const,
+                    hint: 'window',
+                    scrollTop: doc.scrollTop,
+                    scrollHeight: doc.scrollHeight,
+                    clientHeight: doc.clientHeight,
+                    atBottom: doc.scrollHeight - doc.scrollTop - doc.clientHeight <= tolerance,
+                };
             }
-            return {
-                ok: true,
-                target: 'window' as const,
-                hint: 'window',
-                scrollTop: doc.scrollTop,
-                scrollHeight: doc.scrollHeight,
-                clientHeight: doc.clientHeight,
-                atBottom: doc.scrollHeight - doc.scrollTop - doc.clientHeight <= tolerance,
-            };
-        }
 
-        return {
-            ok: false,
-            target: 'none' as const,
-            hint: '',
-            scrollTop: 0,
-            scrollHeight: 0,
-            clientHeight: 0,
-            atBottom: false,
-        };
-    }, { mode, attr: SCROLL_CONTAINER_ATTR, tolerance: BOTTOM_TOLERANCE_PX });
+            return {
+                ok: false,
+                target: 'none' as const,
+                hint: '',
+                scrollTop: 0,
+                scrollHeight: 0,
+                clientHeight: 0,
+                atBottom: false,
+            };
+        },
+        { mode, attr: SCROLL_CONTAINER_ATTR, tolerance: BOTTOM_TOLERANCE_PX },
+    );
 }
 
 /**
@@ -384,9 +532,13 @@ async function nudgeScroll(page: Page): Promise<void> {
             await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
             await page.mouse.wheel(0, 4000);
             await page.waitForTimeout(250);
-            await page.keyboard.press('End').catch(() => { /* focus may be elsewhere */ });
+            await page.keyboard.press('End').catch(() => {
+                /* focus may be elsewhere */
+            });
         }
-    } catch { /* nudging is best-effort */ }
+    } catch {
+        /* nudging is best-effort */
+    }
 }
 
 /**
@@ -418,7 +570,9 @@ async function scrollConversationToBottom(page: Page, label = 'conversation'): P
             stableRounds++;
             // Three quiet rounds in a row: the thread has finished loading.
             if (stableRounds >= 3) {
-                log.info(`Scrolled ${label} to bottom (${metrics.hint}, height ${metrics.scrollHeight}px, ${round + 1} rounds).`);
+                log.info(
+                    `Scrolled ${label} to bottom (${metrics.hint}, height ${metrics.scrollHeight}px, ${round + 1} rounds).`,
+                );
                 return true;
             }
         } else {
@@ -447,7 +601,10 @@ async function scrollConversationToBottom(page: Page, label = 'conversation'): P
     return reached;
 }
 
-async function findAppointmentCreated(page: Page, leadName: string): Promise<{ found: boolean; screenshotUrl: string | null }> {
+async function findAppointmentCreated(
+    page: Page,
+    leadName: string,
+): Promise<{ found: boolean; screenshotUrl: string | null }> {
     log.info('Waiting for conversation to load...');
 
     const panelSelectors = [
@@ -468,7 +625,7 @@ async function findAppointmentCreated(page: Page, leadName: string): Promise<{ f
     // question: a short thread that fits on screen is perfectly valid.
     while (Date.now() < deadline) {
         for (const sel of panelSelectors) {
-            if (await page.locator(sel).count() > 0) {
+            if ((await page.locator(sel).count()) > 0) {
                 panelPresent = true;
                 break;
             }
@@ -482,14 +639,18 @@ async function findAppointmentCreated(page: Page, leadName: string): Promise<{ f
         log.warning('No conversation panel found after waiting.');
         if (Actor.isAtHome()) {
             const store = await Actor.openKeyValueStore();
-            await store.setValue('debug-no-panel', await page.screenshot({ type: 'jpeg', quality: 50 }), { contentType: 'image/jpeg' });
+            await store.setValue('debug-no-panel', await page.screenshot({ type: 'jpeg', quality: 50 }), {
+                contentType: 'image/jpeg',
+            });
         }
         return { found: false, screenshotUrl: null };
     }
 
-    log.info(container?.ok
-        ? `Conversation scroll container found: ${container.hint} (${container.target})`
-        : 'Conversation panel found; it does not scroll (thread fits on screen).');
+    log.info(
+        container?.ok
+            ? `Conversation scroll container found: ${container.hint} (${container.target})`
+            : 'Conversation panel found; it does not scroll (thread fits on screen).',
+    );
 
     // Close activity panel for more conversation space
     try {
@@ -499,7 +660,9 @@ async function findAppointmentCreated(page: Page, leadName: string): Promise<{ f
             log.info('Activity panel closed.');
             await page.waitForTimeout(800);
         }
-    } catch { /* panel may not exist */ }
+    } catch {
+        /* panel may not exist */
+    }
 
     // Closing the panel reflows the page, so drop the tag and re-resolve the
     // container against the new layout before scrolling.
@@ -572,7 +735,7 @@ async function findAppointmentCreated(page: Page, leadName: string): Promise<{ f
             const final = await conversationScroll(page, 'measure');
             log.info(
                 `Capturing at scrollTop=${final.scrollTop}/${final.scrollHeight} ` +
-                `(atBottom=${final.atBottom || atBottom})`
+                    `(atBottom=${final.atBottom || atBottom})`,
             );
 
             const screenshot = await page.screenshot({ type: 'jpeg', quality: 75, timeout: 30000 });
@@ -610,9 +773,13 @@ log.info('Starting Appointment Booking verification', {
 });
 
 const { context, persistent } = await getContext(input);
+// Local dev runs through tsx, which wraps named functions in a __name() helper.
+// Code passed to page.evaluate() carries those calls into the browser, where the
+// helper is missing, so provide a no-op there.
+await context.addInitScript('globalThis.__name = globalThis.__name || ((fn) => fn);');
 
 try {
-    const page = persistent ? context.pages()[0] || await context.newPage() : await context.newPage();
+    const page = persistent ? context.pages()[0] || (await context.newPage()) : await context.newPage();
 
     log.info('Navigating to sub-account...');
     await page.goto(input.subAccountUrl, { waitUntil: 'load', timeout: 120000 });
@@ -627,19 +794,30 @@ try {
     // isVisible() checks (instead of one long-lived waitForSelector) also
     // survives that mid-flight client-side redirect without erroring out.
     const dashboardSelector = '#globalSearchOpener';
-    const loginSelector = 'input[type="email"], input[type="password"], button:has-text("Login"), button:has-text("Sign in")';
+    const loginSelector =
+        'input[type="email"], input[type="password"], button:has-text("Login"), button:has-text("Sign in")';
     const loggedOutUrl = (url: string) => /[/?&](login|logout|oauth)(\/|$|[=&?])/.test(url);
 
     async function detectAuthState(maxWaitMs: number): Promise<'dashboard' | 'login' | 'unknown'> {
         const deadline = Date.now() + maxWaitMs;
         while (Date.now() < deadline) {
             const [hasDashboard, hasLogin] = await Promise.all([
-                page.locator(dashboardSelector).first().isVisible().catch(() => false),
-                page.locator(loginSelector).first().isVisible().catch(() => false),
+                page
+                    .locator(dashboardSelector)
+                    .first()
+                    .isVisible()
+                    .catch(() => false),
+                page
+                    .locator(loginSelector)
+                    .first()
+                    .isVisible()
+                    .catch(() => false),
             ]);
             if (hasDashboard) return 'dashboard';
             if (hasLogin) return 'login';
-            await page.waitForTimeout(500).catch(() => { /* page may be mid-navigation */ });
+            await page.waitForTimeout(500).catch(() => {
+                /* page may be mid-navigation */
+            });
         }
         return loggedOutUrl(page.url()) ? 'login' : 'unknown';
     }
@@ -666,9 +844,12 @@ try {
         // Genuinely ambiguous after 20s of polling — fall back to the longer
         // retried wait as a safety net rather than guessing either way.
         log.info('Auth state unclear after 20s — falling back to dashboard wait/retry.');
-        await retry(async () => {
-            await page.waitForSelector(dashboardSelector, { state: 'visible', timeout: 90000 });
-        }, { attempts: 2, delayMs: 5000, label: 'wait for dashboard' });
+        await retry(
+            async () => {
+                await page.waitForSelector(dashboardSelector, { state: 'visible', timeout: 90000 });
+            },
+            { attempts: 2, delayMs: 5000, label: 'wait for dashboard' },
+        );
         log.info('Dashboard loaded.');
     }
 
